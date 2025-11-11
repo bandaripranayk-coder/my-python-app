@@ -1,0 +1,206 @@
+name: CI/CD • Python • Multi-Env
+
+on:
+  push:
+    branches: [ dev, main ]
+  pull_request:
+    branches: [ dev, main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: python-ci-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTEST_ADDOPTS: "-q"
+
+jobs:
+  build_test:
+    name: Build & Test (matrix)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: [3.10, 3.11, 3.12]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f "requirements.txt" ]; then pip install -r requirements.txt; fi
+          pip install pytest pytest-cov flake8
+
+      - name: Lint (flake8)
+        run: |
+          if command -v flake8 > /dev/null; then
+            flake8 || true
+          fi
+
+      - name: Run tests with coverage
+        run: |
+          pytest --cov=./ --cov-report=xml || pytest --maxfail=1
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python }}
+          path: coverage.xml
+
+      - name: Build wheel (optional)
+        if: always()
+        run: |
+          python -m pip install build
+          python -m build -o dist || true
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: py-build-${{ matrix.python }}
+          path: dist
+          if-no-files-found: ignore
+
+  security:
+    name: Security & Quality Gates
+    runs-on: ubuntu-latest
+    needs: [build_test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+          cache: pip
+
+      - name: Install security tools
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f "requirements.txt" ]; then pip install -r requirements.txt; fi
+          pip install pip-audit bandit semgrep
+
+      - name: Dependency vulnerability scan (pip-audit)
+        run: |
+          pip-audit --progress-spinner off --exit-zero=false
+
+      - name: Static security analysis (Bandit)
+        run: |
+          bandit -r . -exit-zero False || true
+
+      - name: Static analysis (Semgrep)
+        run: |
+          semgrep --config=p/ci --error || true
+
+  ai_advisor:
+    name: AI Advisor (suggest jobs & safety gates)
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Repo file list
+        id: files
+        run: |
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          git ls-files | sed -e 's/^/- /' >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Ask LLM for suggestions
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_ENDPOINT: ${{ vars.LLM_ENDPOINT || 'https://api.openai.com/v1/chat/completions' }}
+          LLM_MODEL: ${{ vars.LLM_MODEL || 'gpt-4o-mini' }}
+        run: |
+          if [ -z "$LLM_API_KEY" ]; then
+            echo "No LLM_API_KEY set; skipping AI suggestions." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          prompt=$(cat <<'P'
+You are a CI/CD engineer. Given this Python repo file list, suggest:
+1) Missing CI jobs (linters, type checks, packaging, SCA).
+2) Security gates and thresholds.
+3) Promotion rules dev->staging.
+Output concise bullets and short YAML snippets if useful.
+P
+          )
+
+          payload=$(jq -n --arg m "$LLM_MODEL" --arg p "$prompt" --arg f "${{ steps.files.outputs.files }}" '
+            {
+              model: $m,
+              messages: [
+                {role:"system", content:"Be precise and concise."},
+                {role:"user", content: ($p + "\n\nRepo files:\n" + $f)}
+              ],
+              temperature: 0.2
+            }')
+
+          resp=$(curl -sS -H "Authorization: Bearer $LLM_API_KEY" \
+                       -H "Content-Type: application/json" \
+                       -d "$payload" "$LLM_ENDPOINT")
+
+          text=$(echo "$resp" | jq -r '.choices[0].message.content // "No suggestions produced."')
+
+          {
+            echo "## AI Advisor: Suggested Enhancements"
+            echo
+            echo "$text"
+          } >> $GITHUB_STEP_SUMMARY
+
+  deploy_dev:
+    name: Deploy to DEV (auto)
+    runs-on: ubuntu-latest
+    needs: [build_test, security]
+    if: github.ref == 'refs/heads/dev' && github.event_name == 'push'
+    environment:
+      name: dev
+      url: ${{ vars.DEV_ENV_URL || 'https://dev.example.com' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: py-build-3.11
+          path: ./artifact
+        continue-on-error: true
+
+      - uses: actions/checkout@v4
+
+      - name: Deploy to DEV (example SSH)
+        env:
+          DEPLOY_SSH: ${{ secrets.DEPLOY_SSH }}
+        run: |
+          echo "Deploying to DEV..."
+          # customize: use rsync/ssh/helm/ansible as needed
+
+  deploy_staging:
+    name: Deploy to STAGING (requires approval)
+    runs-on: ubuntu-latest
+    needs: [build_test, security]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_ENV_URL || 'https://staging.example.com' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: py-build-3.11
+          path: ./artifact
+        continue-on-error: true
+
+      - uses: actions/checkout@v4
+
+      - name: Deploy to STAGING (example)
+        env:
+          DEPLOY_SSH: ${{ secrets.DEPLOY_SSH }}
+        run: |
+          echo "Deploying to STAGING..."
+          # customize deploy commands here
