@@ -40,3 +40,22 @@ jobs:
         with:
           name: coverage-report
           path: coverage.xml
+  deploy_staging:
+    name: Deploy to Staging
+    needs: test
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://example.com/staging
+    steps:
+      - name: Approval Required
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ secrets.GITHUB_TOKEN }}
+          approvers: bandaripranayk-coder
+
+      - name: Simulate Deployment
+        run: |
+          echo "🚀 Deploying to staging environment..."
+          sleep 5
+          echo "✅ Deployment complete."
